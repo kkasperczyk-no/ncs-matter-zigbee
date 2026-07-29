@@ -1,0 +1,23 @@
+#
+# Copyright (c) 2026 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig MATTER_ZIGBEE_UI
+	bool "Shared UI definitions for combined Matter + Zigbee samples"
+	depends on MATTER_ZIGBEE_ADD_ON
+	default y
+	help
+	  Central button and LED role definitions used by the samples.
+
+if MATTER_ZIGBEE_UI
+
+config MATTER_ZIGBEE_UI_FACTORY_RESET_PRESS_TIME_SECONDS
+	int "Factory reset button hold time (seconds)"
+	range 1 30
+	default 5
+	help
+	  Hold time for factory reset using button.
+
+endif # MATTER_ZIGBEE_UI

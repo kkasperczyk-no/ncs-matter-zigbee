@@ -16,6 +16,8 @@
 #include <matter_zigbee_protocol_state.h>
 #endif
 
+#include <matter_zigbee_ui_config.h>
+
 #include <soc.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/pwm.h>
@@ -57,7 +59,7 @@ extern "C" {
 #include <zephyr/sys/reboot.h>
 #endif
 
-#define RUN_STATUS_LED DK_LED1
+#define RUN_STATUS_LED         DK_LED1
 #define RUN_LED_BLINK_INTERVAL 1000
 
 /* Device endpoint, used to receive light controlling commands. */
@@ -98,25 +100,10 @@ extern "C" {
  */
 #define BULB_INIT_BASIC_PH_ENV ZB_ZCL_BASIC_ENV_UNSPECIFIED
 
-/* LED indicating that light switch successfully joind Zigbee network. */
-#define ZIGBEE_NETWORK_STATE_LED DK_LED3
-
 /* LED immitaing dimmable light bulb - define for informational
  * purposes only.
  */
 #define BULB_LED DK_LED4
-
-#if CONFIG_ZIGBEE_FOTA
-#define OTA_ACTIVITY_LED DK_LED2
-#endif
-
-#if defined(CONFIG_MATTER_ZIGBEE_COEXISTENCE_BUTTON_SWITCH)
-/* Long-press to switch active protocol. */
-#define PROTOCOL_SWITCH_BUTTON DK_BTN3_MSK
-#endif
-
-/* Button used to enter the Bulb into the Identify mode. */
-#define IDENTIFY_MODE_BUTTON DK_BTN4_MSK
 
 /* Use onboard led4 to act as a light bulb.
  * The app.overlay file has this at node label "pwm_led3" in /pwmleds.
@@ -135,9 +122,6 @@ static const struct pwm_dt_spec led_pwm = PWM_DT_SPEC_GET(PWM_DK_LED_NODE);
 #ifndef ZB_ROUTER_ROLE
 #error Define ZB_ROUTER_ROLE to compile router source code.
 #endif
-
-/* Button to start Factory Reset */
-#define FACTORY_RESET_BUTTON IDENTIFY_MODE_BUTTON
 
 LOG_MODULE_REGISTER(app, CONFIG_CHIP_APP_LOG_LEVEL);
 
@@ -238,7 +222,8 @@ static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 {
 #ifdef CONFIG_MATTER_ZIGBEE_COEXISTENCE
 #ifdef CONFIG_MATTER_ZIGBEE_COEXISTENCE_BUTTON_SWITCH
-	(void)matter_zigbee_coexistence_process_switch_button(button_state, has_changed, PROTOCOL_SWITCH_BUTTON);
+	(void)matter_zigbee_coexistence_process_switch_button(button_state, has_changed,
+							     MATTER_ZIGBEE_UI_BUTTON_PROTOCOL_SWITCH_MSK);
 #endif
 
 	if (!protocol_is_zigbee_active()) {
@@ -246,8 +231,8 @@ static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 	}
 #endif
 
-	if (IDENTIFY_MODE_BUTTON & has_changed) {
-		if (IDENTIFY_MODE_BUTTON & button_state) {
+	if (MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK & has_changed) {
+		if (MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK & button_state) {
 			/* Button changed its state to pressed */
 		} else {
 			/* Button changed its state to released */
@@ -484,7 +469,7 @@ static void ota_evt_handler(const struct zigbee_fota_evt *evt)
 {
 	switch (evt->id) {
 	case ZIGBEE_FOTA_EVT_PROGRESS:
-		dk_set_led(OTA_ACTIVITY_LED, evt->dl.progress % 2);
+		dk_set_led(MATTER_ZIGBEE_UI_LED_OTA_ACTIVITY, evt->dl.progress % 2);
 		break;
 
 	case ZIGBEE_FOTA_EVT_FINISHED:
@@ -588,7 +573,7 @@ void zboss_signal_handler(zb_bufid_t bufid)
 #endif
 
 	/* Update network status LED. */
-	zigbee_led_status_update(bufid, ZIGBEE_NETWORK_STATE_LED);
+	zigbee_led_status_update(bufid, MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
 
 #if defined(CONFIG_ZIGBEE_TOUCHLINK_TARGET)
 	zigbee_touchlink_target_signal_handler(bufid);
@@ -626,7 +611,7 @@ extern "C" int ZigbeeStart(void)
 		LOG_ERR("settings initialization failed");
 	}
 #endif
-	register_factory_reset_button(FACTORY_RESET_BUTTON);
+	register_factory_reset_button(MATTER_ZIGBEE_UI_BUTTON_FACTORY_RESET_MSK);
 
 #endif /* CONFIG_MATTER_ZIGBEE_COEXISTENCE */
 

@@ -6,7 +6,7 @@
 
 menuconfig MATTER_ZIGBEE_SMP_DFU
 	bool "SMP DFU button handler for combined Matter + Zigbee samples"
-	depends on MATTER_ZIGBEE_ADD_ON && CHIP_DFU_OVER_BT_SMP
+	depends on MATTER_ZIGBEE_ADD_ON && MATTER_ZIGBEE_UI && CHIP_DFU_OVER_BT_SMP
 	depends on NCS_SAMPLE_MATTER_CUSTOM_BLUETOOTH_ADVERTISING
 	default y
 	help

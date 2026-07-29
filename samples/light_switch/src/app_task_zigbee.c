@@ -14,6 +14,7 @@
 
 #include <matter_zigbee_coexistence.h>
 #include <matter_zigbee_protocol_state.h>
+#include <matter_zigbee_ui_config.h>
 
 #include <dk_buttons_and_leds.h>
 #include <ram_pwrdn.h>
@@ -39,11 +40,6 @@
 #if defined(CONFIG_ZIGBEE_FOTA) || defined(CONFIG_ZIGBEE_BT_DFU)
 #include <zephyr/dfu/mcuboot.h>
 #endif
-
-#if CONFIG_ZIGBEE_FOTA
-/* LED indicating OTA Client Activity. */
-#define OTA_ACTIVITY_LED DK_LED2
-#endif /* CONFIG_ZIGBEE_FOTA */
 
 #ifdef CONFIG_ZIGBEE_BT_DFU
 #include <zigbee/zigbee_bt_dfu.h>
@@ -80,10 +76,7 @@
  * for all network devices before running other samples.
  */
 #define ERASE_PERSISTENT_CONFIG ZB_FALSE
-/* LED indicating that light switch successfully joind Zigbee network. */
-#define ZIGBEE_NETWORK_STATE_LED DK_LED3
-/* LED used for device identification. */
-#define IDENTIFY_LED ZIGBEE_NETWORK_STATE_LED
+
 /* LED indicating that light witch found a light bulb to control. */
 #define BULB_FOUND_LED DK_LED4
 /* Button ID used to switch on the light bulb. */
@@ -91,7 +84,7 @@
 /* Button ID used to switch off the light bulb. */
 #define BUTTON_OFF DK_BTN2_MSK
 /* Dim step size - increases/decreses current level (range 0x000 - 0xfe). */
-#define DIMM_STEP 15
+#define DIMM_STEP      15
 /* Button ID used to enable sleepy behavior (sampled once at boot). */
 #define BUTTON_SLEEPY DK_BTN3_MSK
 
@@ -100,25 +93,12 @@
 #define BUTTON_TOUCHLINK DK_BTN3_MSK
 #endif
 
-#if defined(CONFIG_MATTER_ZIGBEE_COEXISTENCE_BUTTON_SWITCH)
-/* Long press switches protocol in coex builds. */
-#define PROTOCOL_SWITCH_BUTTON DK_BTN3_MSK
-#endif
-
-/* Button to start Factory Reset */
-#define FACTORY_RESET_BUTTON DK_BTN4_MSK
-
-/* Button used to enter the Identify mode. */
-#define IDENTIFY_MODE_BUTTON DK_BTN4_MSK
-
 /* Transition time for a single step operation in 0.1 sec units.
  * 0xFFFF - immediate change.
  */
 #define DIMM_TRANSACTION_TIME 2
 
-/* Time after which the button state is checked again to detect button hold,
- * the dimm command is sent again.
- */
+/* Time after which the button state is checked again to detect button hold. */
 #define BUTTON_LONG_POLL_TMO K_MSEC(500)
 
 #if !defined ZB_ED_ROLE
@@ -289,9 +269,11 @@ static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 #if defined(CONFIG_MATTER_ZIGBEE_COEXISTENCE_BUTTON_SWITCH)
 #if defined(CONFIG_ZIGBEE_TOUCHLINK_INITIATOR)
 	bool protocol_switch_short_release =
-		matter_zigbee_coexistence_process_switch_button(button_state, has_changed, PROTOCOL_SWITCH_BUTTON);
+		matter_zigbee_coexistence_process_switch_button(button_state, has_changed,
+							      MATTER_ZIGBEE_UI_BUTTON_PROTOCOL_SWITCH_MSK);
 #else
-	(void)matter_zigbee_coexistence_process_switch_button(button_state, has_changed, PROTOCOL_SWITCH_BUTTON);
+	(void)matter_zigbee_coexistence_process_switch_button(button_state, has_changed,
+							     MATTER_ZIGBEE_UI_BUTTON_PROTOCOL_SWITCH_MSK);
 #endif
 #endif
 
@@ -333,8 +315,8 @@ static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 		LOG_DBG("OFF - button changed");
 		cmd_id = ZB_ZCL_CMD_ON_OFF_OFF_ID;
 		break;
-	case IDENTIFY_MODE_BUTTON:
-		if (IDENTIFY_MODE_BUTTON & button_state) {
+	case MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK:
+		if (MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK & button_state) {
 			/* Button changed its state to pressed */
 		} else {
 			/* Button changed its state to released */
@@ -445,7 +427,7 @@ static void toggle_identify_led(zb_bufid_t bufid)
 {
 	static int blink_status;
 
-	led_set(IDENTIFY_LED, (++blink_status) % 2);
+	led_set(MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK, (++blink_status) % 2);
 	ZB_SCHEDULE_APP_ALARM(toggle_identify_led, bufid, ZB_MILLISECONDS_TO_BEACON_INTERVAL(100));
 }
 
@@ -467,9 +449,9 @@ static void identify_cb(zb_bufid_t bufid)
 
 		/* Update network status/idenitfication LED. */
 		if (ZB_JOINED()) {
-			led_set_on(ZIGBEE_NETWORK_STATE_LED);
+			led_set_on(MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
 		} else {
-			led_set_off(ZIGBEE_NETWORK_STATE_LED);
+			led_set_off(MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
 		}
 	}
 }
@@ -648,7 +630,7 @@ static void ota_evt_handler(const struct zigbee_fota_evt *evt)
 {
 	switch (evt->id) {
 	case ZIGBEE_FOTA_EVT_PROGRESS:
-		led_set(OTA_ACTIVITY_LED, evt->dl.progress % 2);
+		led_set(MATTER_ZIGBEE_UI_LED_OTA_ACTIVITY, evt->dl.progress % 2);
 		break;
 
 	case ZIGBEE_FOTA_EVT_FINISHED:
@@ -699,7 +681,7 @@ void zboss_signal_handler(zb_bufid_t bufid)
 	zb_ret_t status = ZB_GET_APP_SIGNAL_STATUS(bufid);
 
 	/* Update network status LED. */
-	zigbee_led_status_update(bufid, ZIGBEE_NETWORK_STATE_LED);
+	zigbee_led_status_update(bufid, MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
 
 #ifdef CONFIG_ZIGBEE_FOTA
 	/* Pass signal to the OTA client implementation. */
@@ -904,7 +886,7 @@ int ZigbeeStart(void)
 
 #ifndef CONFIG_CHIP
 	configure_gpio();
-	register_factory_reset_button(FACTORY_RESET_BUTTON);
+	register_factory_reset_button(MATTER_ZIGBEE_UI_BUTTON_FACTORY_RESET_MSK);
 #endif
 
 	alarm_timers_init();
