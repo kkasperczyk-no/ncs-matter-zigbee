@@ -13,13 +13,16 @@
 #include "board/board.h"
 #include "clusters/identify.h"
 
+#include <app-common/zap-generated/attributes/Accessors.h>
+#include <app/server/Server.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 
 #include <matter_zigbee_coexistence.h>
+#include <matter_zigbee_ui.h>
+#include <matter_zigbee_ui_config.h>
+#include <matter_zigbee_ui_led.h>
 
-#if defined(CONFIG_MATTER_ZIGBEE_SMP_DFU)
-#include <matter_zigbee_smp_dfu.h>
-#endif
+#include <dk_buttons_and_leds.h>
 
 #include <zephyr/logging/log.h>
 
@@ -31,118 +34,132 @@ using namespace ::chip::DeviceLayer;
 
 namespace
 {
-constexpr uint32_t kDimmerTriggeredTimeout = 500;
-constexpr uint32_t kDimmerInterval = 300;
 constexpr EndpointId kLightSwitchEndpointId = 1;
 constexpr EndpointId kLightEndpointId = 1;
 
-k_timer sDimmerPressKeyTimer;
-k_timer sDimmerTimer;
+k_timer sLightPressTimer;
+k_timer sLightDimTimer;
+k_timer sIdentifyPressTimer;
+k_timer sIdentifyDimTimer;
 
-Nrf::Matter::IdentifyCluster sIdentifyCluster(kLightEndpointId);
+bool sLightHoldActive;
+bool sIdentifyHoldActive;
 
-bool sWasDimmerTriggered = false;
+class SwitchIdentifyDelegate : public Nrf::Matter::IdentifyDelegateImplNrf {
+public:
+	SwitchIdentifyDelegate() : IdentifyDelegateImplNrf(false, []() { matter_zigbee_ui_led_zigbee_identify_stop(); })
+	{
+	}
 
-#define APPLICATION_BUTTON_MASK DK_BTN2_MSK
+	void OnIdentifyStart(chip::app::Clusters::IdentifyCluster &cluster) override
+	{
+		ARG_UNUSED(cluster);
+		matter_zigbee_ui_led_zigbee_identify_start();
+	}
 
-#ifdef CONFIG_CHIP_ICD_UAT_SUPPORT
-#define UAT_BUTTON_MASK DK_BTN3_MSK
-#endif
+	void OnIdentifyStop(chip::app::Clusters::IdentifyCluster &cluster) override
+	{
+		ARG_UNUSED(cluster);
+		matter_zigbee_ui_led_zigbee_identify_stop();
+	}
+};
+
+SwitchIdentifyDelegate sIdentifyDelegate;
+Nrf::Matter::IdentifyCluster sIdentifyCluster(kLightEndpointId, sIdentifyDelegate);
+
+void TriggerMatterIdentify()
+{
+	Clusters::Identify::Attributes::IdentifyTime::Set(kLightEndpointId, 3);
+}
+
+void LightDimTimerEventHandler()
+{
+	LightSwitch::GetInstance().DimmerChangeBrightness(true);
+}
+
+void IdentifyDimTimerEventHandler()
+{
+	LightSwitch::GetInstance().DimmerChangeBrightness(false);
+}
+
+void LightPressTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+
+	sLightHoldActive = true;
+	k_timer_start(&sLightDimTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS),
+		      K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS));
+	Nrf::PostTask([] { LightDimTimerEventHandler(); });
+}
+
+void IdentifyPressTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+
+	sIdentifyHoldActive = true;
+	k_timer_start(&sIdentifyDimTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS),
+		      K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS));
+	Nrf::PostTask([] { IdentifyDimTimerEventHandler(); });
+}
+
+void LightDimTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	Nrf::PostTask([] { LightDimTimerEventHandler(); });
+}
+
+void IdentifyDimTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	Nrf::PostTask([] { IdentifyDimTimerEventHandler(); });
+}
+
 } /* namespace */
-
-void AppTask::DimmerTriggerEventHandler()
-{
-	if (!sWasDimmerTriggered) {
-		LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::Toggle);
-	}
-
-	Instance().CancelTimer(Timer::Dimmer);
-	Instance().CancelTimer(Timer::DimmerTrigger);
-	sWasDimmerTriggered = false;
-}
-
-void AppTask::TimerEventHandler(const Timer &timerType)
-{
-	switch (timerType) {
-	case Timer::DimmerTrigger:
-		LOG_INF("Dimming started...");
-		sWasDimmerTriggered = true;
-		LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::On);
-		Instance().StartTimer(Timer::Dimmer, kDimmerInterval);
-		Instance().CancelTimer(Timer::DimmerTrigger);
-		break;
-	case Timer::Dimmer:
-		LightSwitch::GetInstance().DimmerChangeBrightness();
-		break;
-	default:
-		break;
-	}
-}
 
 void AppTask::ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChanged)
 {
-	if ((APPLICATION_BUTTON_MASK & state & hasChanged)) {
-		LOG_INF("Button has been pressed, keep in this state for at least 500 ms to change light sensitivity of bound lighting devices.");
-		Instance().StartTimer(Timer::DimmerTrigger, kDimmerTriggeredTimeout);
-	} else if ((APPLICATION_BUTTON_MASK & hasChanged)) {
-		Nrf::PostTask([] { DimmerTriggerEventHandler(); });
 #ifdef CONFIG_CHIP_ICD_UAT_SUPPORT
-	} else if ((UAT_BUTTON_MASK & state & hasChanged)) {
+	if ((MATTER_ZIGBEE_UI_BUTTON_PROTOCOL_SWITCH_MSK & state & hasChanged)) {
 		LOG_INF("ICD UserActiveMode has been triggered.");
 		Server::GetInstance().GetICDManager().OnNetworkActivity();
+		return;
+	}
 #endif
-	}
-}
 
-void AppTask::StartTimer(Timer timer, uint32_t timeoutMs)
-{
-	switch (timer) {
-	case Timer::DimmerTrigger:
-		k_timer_start(&sDimmerPressKeyTimer, K_MSEC(timeoutMs), K_NO_WAIT);
-		break;
-	case Timer::Dimmer:
-		k_timer_start(&sDimmerTimer, K_MSEC(timeoutMs), K_MSEC(timeoutMs));
-		break;
-	default:
-		break;
-	}
-}
-
-void AppTask::CancelTimer(Timer timer)
-{
-	switch (timer) {
-	case Timer::DimmerTrigger:
-		k_timer_stop(&sDimmerPressKeyTimer);
-		break;
-	case Timer::Dimmer:
-		k_timer_stop(&sDimmerTimer);
-		break;
-	default:
-		break;
-	}
-}
-
-void AppTask::UserTimerTimeoutCallback(k_timer *timer)
-{
-	if (!timer) {
-		return;
-	}
-	Timer timerType;
-
-	if (timer == &sDimmerPressKeyTimer) {
-		timerType = Timer::DimmerTrigger;
-	} else if (timer == &sDimmerTimer) {
-		timerType = Timer::Dimmer;
-	} else {
+	if (hasChanged & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+		if (state & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+			sLightHoldActive = false;
+			k_timer_start(&sLightPressTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_HOLD_THRESHOLD_MS), K_NO_WAIT);
+		} else {
+			k_timer_stop(&sLightPressTimer);
+			k_timer_stop(&sLightDimTimer);
+			if (!sLightHoldActive) {
+				Nrf::PostTask([] {
+					LightSwitch::GetInstance().InitiateActionSwitch(LightSwitch::Action::Toggle);
+				});
+			}
+			sLightHoldActive = false;
+		}
 		return;
 	}
 
-	Nrf::PostTask([timerType]() { TimerEventHandler(timerType); });
+	if (hasChanged & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+		if (state & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+			sIdentifyHoldActive = false;
+			k_timer_start(&sIdentifyPressTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_HOLD_THRESHOLD_MS), K_NO_WAIT);
+		} else {
+			k_timer_stop(&sIdentifyPressTimer);
+			k_timer_stop(&sIdentifyDimTimer);
+			if (!sIdentifyHoldActive) {
+				Nrf::PostTask([] { TriggerMatterIdentify(); });
+			}
+			sIdentifyHoldActive = false;
+		}
+	}
 }
 
 CHIP_ERROR AppTask::Init()
 {
-	/* Initialize Matter stack */
 	Nrf::Matter::InitData initData{};
 	initData.mPostServerInitClbk = [] {
 		LightSwitch::GetInstance().Init(kLightSwitchEndpointId);
@@ -154,27 +171,23 @@ CHIP_ERROR AppTask::Init()
 	};
 	ReturnErrorOnFailure(Nrf::Matter::PrepareServer(initData));
 
-	/* Initialize application timers */
-	k_timer_init(&sDimmerPressKeyTimer, AppTask::UserTimerTimeoutCallback, nullptr);
-	k_timer_init(&sDimmerTimer, AppTask::UserTimerTimeoutCallback, nullptr);
+	k_timer_init(&sLightPressTimer, LightPressTimeoutCallback, nullptr);
+	k_timer_init(&sLightDimTimer, LightDimTimeoutCallback, nullptr);
+	k_timer_init(&sIdentifyPressTimer, IdentifyPressTimeoutCallback, nullptr);
+	k_timer_init(&sIdentifyDimTimer, IdentifyDimTimeoutCallback, nullptr);
+
+	matter_zigbee_ui_led_init();
 
 	if (!Nrf::GetBoard().Init(ButtonEventHandler)) {
 		LOG_ERR("User interface initialization failed.");
 		return CHIP_ERROR_INCORRECT_STATE;
 	}
 
-#if defined(CONFIG_MATTER_ZIGBEE_SMP_DFU)
-	matter_zigbee_smp_dfu_init();
-#endif
-
-	/* Register Matter event handler that controls the connectivity status LED based on the captured Matter network
-	 * state. */
-	ReturnErrorOnFailure(Nrf::Matter::RegisterEventHandler(Nrf::Board::DefaultMatterEventHandler, 0));
+	matter_zigbee_ui_button_init();
+	matter_zigbee_ui_led_register_matter_events();
 
 	ReturnErrorOnFailure(sIdentifyCluster.Init());
-
 	ReturnErrorOnFailure(Nrf::Matter::StartServer());
-
 	matter_zigbee_coexistence_on_server_started();
 
 	return CHIP_NO_ERROR;

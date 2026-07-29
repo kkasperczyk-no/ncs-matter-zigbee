@@ -16,7 +16,9 @@
 #include <matter_zigbee_protocol_state.h>
 #endif
 
+#include <matter_zigbee_ui.h>
 #include <matter_zigbee_ui_config.h>
+#include <matter_zigbee_ui_led.h>
 
 #include <soc.h>
 #include <zephyr/device.h>
@@ -59,7 +61,7 @@ extern "C" {
 #include <zephyr/sys/reboot.h>
 #endif
 
-#define RUN_STATUS_LED         DK_LED1
+#define RUN_STATUS_LED MATTER_ZIGBEE_UI_LED_ZIGBEE
 #define RUN_LED_BLINK_INTERVAL 1000
 
 /* Device endpoint, used to receive light controlling commands. */
@@ -100,14 +102,9 @@ extern "C" {
  */
 #define BULB_INIT_BASIC_PH_ENV ZB_ZCL_BASIC_ENV_UNSPECIFIED
 
-/* LED immitaing dimmable light bulb - define for informational
- * purposes only.
- */
-#define BULB_LED DK_LED4
+/* PWM output on LED 2 (README index). */
+#define BULB_LED MATTER_ZIGBEE_UI_LED_LIGHT
 
-/* Use onboard led4 to act as a light bulb.
- * The app.overlay file has this at node label "pwm_led3" in /pwmleds.
- */
 #define PWM_DK_LED_NODE DT_NODELABEL(pwm_led3)
 
 #if DT_NODE_HAS_STATUS(PWM_DK_LED_NODE, okay)
@@ -142,6 +139,18 @@ static bulb_device_ctx_t dev_ctx;
 
 /* Last non-zero brightness used when turning on with CurrentLevel == 0. */
 static zb_uint8_t s_last_on_level = ZB_ZCL_LEVEL_CONTROL_LEVEL_MAX_VALUE;
+
+struct buttons_context {
+	uint32_t hold_mask;
+	atomic_t hold_active;
+	struct k_timer hold_timer;
+};
+
+static struct buttons_context buttons_ctx;
+
+static void on_off_set_value(zb_bool_t on);
+static void level_control_set_value(zb_uint16_t new_level);
+static void bulb_button_hold_handler(struct k_timer *timer);
 
 ZB_ZCL_DECLARE_IDENTIFY_ATTRIB_LIST(identify_attr_list, &dev_ctx.identify_attr.identify_time);
 
@@ -213,10 +222,6 @@ static void start_identifying(zb_bufid_t bufid)
 }
 
 /**@brief Implementation of button event handling for the Zigbee bulb.
- *
- * In combined Matter+Zigbee builds the handler returns early when Matter is
- * the active protocol so Matter's own handlers (registered by Board::Init())
- * keep full ownership of the buttons.
  */
 static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 {
@@ -231,24 +236,74 @@ static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 	}
 #endif
 
-	if (MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK & has_changed) {
-		if (MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK & button_state) {
-			/* Button changed its state to pressed */
+	if (has_changed & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+		if (button_state & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+			buttons_ctx.hold_mask = MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK;
+			atomic_set(&buttons_ctx.hold_active, 0);
+			k_timer_start(&buttons_ctx.hold_timer,
+				      K_MSEC(MATTER_ZIGBEE_UI_DIM_HOLD_THRESHOLD_MS), K_NO_WAIT);
 		} else {
-			/* Button changed its state to released */
-			if (was_factory_reset_done()) {
-				/* The long press was for Factory Reset */
-				LOG_DBG("After Factory Reset - ignore button release");
-			} else {
-				/* Button released before Factory Reset */
+			k_timer_stop(&buttons_ctx.hold_timer);
+			if (atomic_set(&buttons_ctx.hold_active, 0) == 0) {
+				on_off_set_value(!dev_ctx.on_off_attr.on_off);
+			}
+		}
+		return;
+	}
 
-				/* Start identification mode */
+	if (has_changed & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+		if (button_state & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+			buttons_ctx.hold_mask = MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK;
+			atomic_set(&buttons_ctx.hold_active, 0);
+			k_timer_start(&buttons_ctx.hold_timer,
+				      K_MSEC(MATTER_ZIGBEE_UI_DIM_HOLD_THRESHOLD_MS), K_NO_WAIT);
+		} else {
+			k_timer_stop(&buttons_ctx.hold_timer);
+			if (atomic_set(&buttons_ctx.hold_active, 0) == 0) {
 				ZB_SCHEDULE_APP_CALLBACK(start_identifying, 0);
 			}
 		}
 	}
+}
 
-	check_factory_reset_button(button_state, has_changed);
+static void bulb_button_hold_handler(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+
+	uint32_t buttons = dk_get_buttons();
+
+	if (!(buttons & buttons_ctx.hold_mask)) {
+		atomic_set(&buttons_ctx.hold_active, 0);
+		return;
+	}
+
+	atomic_set(&buttons_ctx.hold_active, 1);
+
+	if (buttons_ctx.hold_mask == MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+		zb_uint8_t level = dev_ctx.level_control_attr.current_level;
+
+		if (level + MATTER_ZIGBEE_UI_DIM_STEP > ZB_ZCL_LEVEL_CONTROL_LEVEL_MAX_VALUE) {
+			level = ZB_ZCL_LEVEL_CONTROL_LEVEL_MAX_VALUE;
+		} else {
+			level += MATTER_ZIGBEE_UI_DIM_STEP;
+		}
+		level_control_set_value(level);
+		on_off_set_value(ZB_TRUE);
+	} else {
+		zb_uint8_t level = dev_ctx.level_control_attr.current_level;
+
+		if (level < MATTER_ZIGBEE_UI_DIM_STEP) {
+			level = 0;
+		} else {
+			level -= MATTER_ZIGBEE_UI_DIM_STEP;
+		}
+		level_control_set_value(level);
+		if (level == 0) {
+			on_off_set_value(ZB_FALSE);
+		}
+	}
+
+	k_timer_start(&buttons_ctx.hold_timer, K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS), K_NO_WAIT);
 }
 
 #ifdef CONFIG_MATTER_ZIGBEE_COEXISTENCE
@@ -259,11 +314,7 @@ extern "C" void zb_button_handler(uint32_t button_state, uint32_t has_changed)
 
 extern "C" void zb_register_button_handler(void)
 {
-	static struct button_handler handler = {
-		.cb = zb_button_handler,
-	};
-
-	dk_button_handler_add(&handler);
+	matter_zigbee_ui_on_matter_board_ready(zb_button_handler);
 }
 #else
 /**@brief Callback wrapper for button events (Zigbee-only builds). */
@@ -469,7 +520,7 @@ static void ota_evt_handler(const struct zigbee_fota_evt *evt)
 {
 	switch (evt->id) {
 	case ZIGBEE_FOTA_EVT_PROGRESS:
-		dk_set_led(MATTER_ZIGBEE_UI_LED_OTA_ACTIVITY, evt->dl.progress % 2);
+		dk_set_led(MATTER_ZIGBEE_UI_LED_ZIGBEE, evt->dl.progress % 2);
 		break;
 
 	case ZIGBEE_FOTA_EVT_FINISHED:
@@ -573,7 +624,7 @@ void zboss_signal_handler(zb_bufid_t bufid)
 #endif
 
 	/* Update network status LED. */
-	zigbee_led_status_update(bufid, MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
+	matter_zigbee_ui_led_zigbee_signal(bufid);
 
 #if defined(CONFIG_ZIGBEE_TOUCHLINK_TARGET)
 	zigbee_touchlink_target_signal_handler(bufid);
@@ -602,7 +653,8 @@ extern "C" int ZigbeeStart(void)
 
 	LOG_INF("Starting Zigbee R23 Light Bulb example");
 
-	/* Initialize Buttons and Leds only if not using Matter */
+	k_timer_init(&buttons_ctx.hold_timer, bulb_button_hold_handler, NULL);
+
 #ifndef CONFIG_MATTER_ZIGBEE_COEXISTENCE
 	configure_gpio();
 #ifdef CONFIG_ZIGBEE_SCENES
@@ -611,7 +663,6 @@ extern "C" int ZigbeeStart(void)
 		LOG_ERR("settings initialization failed");
 	}
 #endif
-	register_factory_reset_button(MATTER_ZIGBEE_UI_BUTTON_FACTORY_RESET_MSK);
 
 #endif /* CONFIG_MATTER_ZIGBEE_COEXISTENCE */
 
@@ -664,10 +715,14 @@ extern "C" int ZigbeeStart(void)
 
 	LOG_INF("Zigbee R23 Light Bulb example started");
 
+#ifdef CONFIG_MATTER_ZIGBEE_COEXISTENCE
+	return 0;
+#else
 	while (1) {
 		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
 		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
 	}
+#endif
 
 	return 0;
 }

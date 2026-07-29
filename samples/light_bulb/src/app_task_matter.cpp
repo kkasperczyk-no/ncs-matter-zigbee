@@ -26,9 +26,9 @@
 #include <matter_zigbee_coexistence.h>
 #endif
 
-#if defined(CONFIG_MATTER_ZIGBEE_SMP_DFU)
-#include <matter_zigbee_smp_dfu.h>
-#endif
+#include <matter_zigbee_ui.h>
+#include <matter_zigbee_ui_config.h>
+#include <matter_zigbee_ui_led.h>
 
 #include <zephyr/logging/log.h>
 
@@ -44,36 +44,125 @@ constexpr EndpointId kLightEndpointId = 1;
 constexpr uint8_t kDefaultMinLevel = 0;
 constexpr uint8_t kDefaultMaxLevel = 254;
 
-Nrf::Matter::IdentifyCluster sIdentifyCluster(kLightEndpointId, true, []() {
-	Nrf::PostTask([] { Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED2).Set(false); });
+k_timer sLightPressTimer;
+k_timer sLightDimTimer;
+k_timer sIdentifyPressTimer;
+k_timer sIdentifyDimTimer;
+
+bool sLightHoldActive;
+bool sIdentifyHoldActive;
+
+class BulbIdentifyDelegate : public Nrf::Matter::IdentifyDelegateImplNrf {
+public:
+	BulbIdentifyDelegate()
+		: IdentifyDelegateImplNrf(false, []() {
+			  Nrf::PostTask([] {
 #if defined(CONFIG_PWM)
-	Nrf::PostTask([] { AppTask::Instance().GetPWMDevice().ApplyLevel(); });
+				  AppTask::Instance().GetPWMDevice().ApplyLevel();
+#else
+				  Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED3).Set(false);
 #endif
-});
+			  });
+		  })
+	{
+	}
+
+	void OnIdentifyStart(chip::app::Clusters::IdentifyCluster &cluster) override
+	{
+		ARG_UNUSED(cluster);
+		Nrf::PostTask([] {
+#if defined(CONFIG_PWM)
+			static bool blink_on;
+			blink_on = !blink_on;
+			if (blink_on) {
+				AppTask::Instance().GetPWMDevice().SetLevel(254, 0);
+			} else {
+				AppTask::Instance().GetPWMDevice().SetLevel(0, 0);
+			}
+#else
+			Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED3).Set(
+				!Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED3).GetState());
+#endif
+		});
+	}
+
+	void OnIdentifyStop(chip::app::Clusters::IdentifyCluster &cluster) override
+	{
+		IdentifyDelegateImplNrf::OnIdentifyStop(cluster);
+	}
+};
+
+BulbIdentifyDelegate sIdentifyDelegate;
+Nrf::Matter::IdentifyCluster sIdentifyCluster(kLightEndpointId, sIdentifyDelegate);
 
 #if defined(CONFIG_PWM)
 const struct pwm_dt_spec sLightPwmDevice = PWM_DT_SPEC_GET(DT_ALIAS(pwm_led1));
 #endif
 
-/* Define a custom attribute persister which makes actual write of the
- * CurrentLevel attribute value to the non-volatile storage only when it has
- * remained constant for 5 seconds. This is to reduce the flash wearout when the
- * attribute changes frequently as a result of MoveToLevel command.
- * DeferredAttribute object describes a deferred attribute, but also holds a
- * buffer with a value to be written, so it must live so long as the
- * DeferredAttributePersistenceProvider object.
- */
 DeferredAttribute gCurrentLevelPersister(ConcreteAttributePath(kLightEndpointId, Clusters::LevelControl::Id,
 							       Clusters::LevelControl::Attributes::CurrentLevel::Id));
-
-/* Deferred persistence will be auto-initialized as soon as the default
- * persistence is initialized */
 DefaultAttributePersistenceProvider gSimpleAttributePersistence;
 DeferredAttributePersistenceProvider gDeferredAttributePersister(gSimpleAttributePersistence,
 								 Span<DeferredAttribute>(&gCurrentLevelPersister, 1),
 								 System::Clock::Milliseconds32(5000));
 
-#define APPLICATION_BUTTON_MASK DK_BTN2_MSK
+void TriggerMatterIdentify()
+{
+	Clusters::Identify::Attributes::IdentifyTime::Set(kLightEndpointId, 3);
+}
+
+void LightDimTimerEventHandler()
+{
+#if defined(CONFIG_PWM)
+	auto &pwm = AppTask::Instance().GetPWMDevice();
+	uint8_t level = pwm.GetLevel();
+
+	level = (level + 10 > 254) ? 254 : level + 10;
+	pwm.InitiateAction(Nrf::PWMDevice::LEVEL_ACTION, static_cast<int32_t>(LightingActor::Button), &level);
+#endif
+}
+
+void IdentifyDimTimerEventHandler()
+{
+#if defined(CONFIG_PWM)
+	auto &pwm = AppTask::Instance().GetPWMDevice();
+	uint8_t level = pwm.GetLevel();
+
+	level = (level < 10) ? 0 : level - 10;
+	pwm.InitiateAction(Nrf::PWMDevice::LEVEL_ACTION, static_cast<int32_t>(LightingActor::Button), &level);
+#endif
+}
+
+void LightPressTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	sLightHoldActive = true;
+	k_timer_start(&sLightDimTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS),
+		      K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS));
+	Nrf::PostTask([] { LightDimTimerEventHandler(); });
+}
+
+void IdentifyPressTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	sIdentifyHoldActive = true;
+	k_timer_start(&sIdentifyDimTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS),
+		      K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS));
+	Nrf::PostTask([] { IdentifyDimTimerEventHandler(); });
+}
+
+void LightDimTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	Nrf::PostTask([] { LightDimTimerEventHandler(); });
+}
+
+void IdentifyDimTimeoutCallback(k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	Nrf::PostTask([] { IdentifyDimTimerEventHandler(); });
+}
+
 } /* namespace */
 
 void AppTask::LightingActionEventHandler(const LightingEvent &event)
@@ -90,78 +179,78 @@ void AppTask::LightingActionEventHandler(const LightingEvent &event)
 		LOG_INF("An action could not be initiated.");
 	}
 #else
-	Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED2).Set(!Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED2).GetState());
+	Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED3).Set(!Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED3).GetState());
 #endif
 }
 
 void AppTask::ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChanged)
 {
-	if ((APPLICATION_BUTTON_MASK & hasChanged) & state) {
-		Nrf::PostTask([] {
-			LightingEvent event;
-			event.Actor = LightingActor::Button;
-			LightingActionEventHandler(event);
-		});
+	if (hasChanged & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+		if (state & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+			sLightHoldActive = false;
+			k_timer_start(&sLightPressTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_HOLD_THRESHOLD_MS), K_NO_WAIT);
+		} else {
+			k_timer_stop(&sLightPressTimer);
+			k_timer_stop(&sLightDimTimer);
+			if (!sLightHoldActive) {
+				Nrf::PostTask([] {
+					LightingEvent event;
+					event.Actor = LightingActor::Button;
+					LightingActionEventHandler(event);
+				});
+			}
+			sLightHoldActive = false;
+		}
+		return;
+	}
+
+	if (hasChanged & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+		if (state & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+			sIdentifyHoldActive = false;
+			k_timer_start(&sIdentifyPressTimer, K_MSEC(MATTER_ZIGBEE_UI_DIM_HOLD_THRESHOLD_MS), K_NO_WAIT);
+		} else {
+			k_timer_stop(&sIdentifyPressTimer);
+			k_timer_stop(&sIdentifyDimTimer);
+			if (!sIdentifyHoldActive) {
+				Nrf::PostTask([] { TriggerMatterIdentify(); });
+			}
+			sIdentifyHoldActive = false;
+		}
 	}
 }
 
 #if defined(CONFIG_PWM)
 void AppTask::ActionInitiated(Nrf::PWMDevice::Action_t action, int32_t actor)
 {
-	if (action == Nrf::PWMDevice::ON_ACTION) {
-		LOG_INF("Turn On Action has been initiated");
-	} else if (action == Nrf::PWMDevice::OFF_ACTION) {
-		LOG_INF("Turn Off Action has been initiated");
-	} else if (action == Nrf::PWMDevice::LEVEL_ACTION) {
-		LOG_INF("Level Action has been initiated");
-	}
+	ARG_UNUSED(action);
+	ARG_UNUSED(actor);
 }
 
 void AppTask::ActionCompleted(Nrf::PWMDevice::Action_t action, int32_t actor)
 {
-	if (action == Nrf::PWMDevice::ON_ACTION) {
-		LOG_INF("Turn On Action has been completed");
-	} else if (action == Nrf::PWMDevice::OFF_ACTION) {
-		LOG_INF("Turn Off Action has been completed");
-	} else if (action == Nrf::PWMDevice::LEVEL_ACTION) {
-		LOG_INF("Level Action has been completed");
-	}
-
 	if (actor == static_cast<int32_t>(LightingActor::Button)) {
 		Instance().UpdateClusterState();
 	}
+	ARG_UNUSED(action);
 }
-#endif /* CONFIG_PWM */
+#endif
 
 void AppTask::UpdateClusterState()
 {
 	SystemLayer().ScheduleLambda([this] {
 #if defined(CONFIG_PWM)
-		/* write the new on/off value */
 		Protocols::InteractionModel::Status status =
 			Clusters::OnOff::Attributes::OnOff::Set(kLightEndpointId, mPWMDevice.IsTurnedOn());
+		if (status == Protocols::InteractionModel::Status::Success) {
+			status = Clusters::LevelControl::Attributes::CurrentLevel::Set(kLightEndpointId,
+										       mPWMDevice.GetLevel());
+		}
 #else
 		Protocols::InteractionModel::Status status = Clusters::OnOff::Attributes::OnOff::Set(
-			kLightEndpointId, Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED2).GetState());
+			kLightEndpointId, Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED3).GetState());
 #endif
 		if (status != Protocols::InteractionModel::Status::Success) {
-			LOG_ERR("Updating on/off cluster failed: %x", to_underlying(status));
-		}
-
-#if defined(CONFIG_PWM)
-		/* write the current level */
-		status = Clusters::LevelControl::Attributes::CurrentLevel::Set(kLightEndpointId, mPWMDevice.GetLevel());
-#else
-		/* write the current level */
-		if (Nrf::GetBoard().GetLED(Nrf::DeviceLeds::LED2).GetState()) {
-			status = Clusters::LevelControl::Attributes::CurrentLevel::Set(kLightEndpointId, 100);
-		} else {
-			status = Clusters::LevelControl::Attributes::CurrentLevel::Set(kLightEndpointId, 0);
-		}
-#endif
-
-		if (status != Protocols::InteractionModel::Status::Success) {
-			LOG_ERR("Updating level cluster failed: %x", to_underlying(status));
+			LOG_ERR("Updating clusters failed: %x", to_underlying(status));
 		}
 	});
 }
@@ -169,7 +258,6 @@ void AppTask::UpdateClusterState()
 void AppTask::InitPWMDDevice()
 {
 #if defined(CONFIG_PWM)
-	/* Initialize lighting device (PWM) */
 	uint8_t minLightLevel = kDefaultMinLevel;
 	Clusters::LevelControl::Attributes::MinLevel::Get(kLightEndpointId, &minLightLevel);
 
@@ -182,7 +270,7 @@ void AppTask::InitPWMDDevice()
 	int ret =
 		mPWMDevice.Init(&sLightPwmDevice, minLightLevel, maxLightLevel, currentLevel.ValueOr(kDefaultMaxLevel));
 	if (ret != 0) {
-		LOG_ERR("Failed to initialize PWD device.");
+		LOG_ERR("Failed to initialize PWM device.");
 	}
 
 	mPWMDevice.SetCallbacks(ActionInitiated, ActionCompleted);
@@ -191,7 +279,6 @@ void AppTask::InitPWMDDevice()
 
 CHIP_ERROR AppTask::Init()
 {
-	/* Initialize Matter stack */
 	Nrf::Matter::InitData initData{};
 	initData.mPostServerInitClbk = []() {
 		app::SetAttributePersistenceProvider(&gDeferredAttributePersister);
@@ -206,21 +293,22 @@ CHIP_ERROR AppTask::Init()
 #endif
 	ReturnErrorOnFailure(Nrf::Matter::PrepareServer(initData));
 
+	k_timer_init(&sLightPressTimer, LightPressTimeoutCallback, nullptr);
+	k_timer_init(&sLightDimTimer, LightDimTimeoutCallback, nullptr);
+	k_timer_init(&sIdentifyPressTimer, IdentifyPressTimeoutCallback, nullptr);
+	k_timer_init(&sIdentifyDimTimer, IdentifyDimTimeoutCallback, nullptr);
+
+	matter_zigbee_ui_led_init();
+
 	if (!Nrf::GetBoard().Init(ButtonEventHandler)) {
 		LOG_ERR("User interface initialization failed.");
 		return CHIP_ERROR_INCORRECT_STATE;
 	}
 
-#if defined(CONFIG_MATTER_ZIGBEE_SMP_DFU)
-	matter_zigbee_smp_dfu_init();
-#endif
-
-	/* Register Matter event handler that controls the connectivity status LED
-	 * based on the captured Matter network state. */
-	ReturnErrorOnFailure(Nrf::Matter::RegisterEventHandler(Nrf::Board::DefaultMatterEventHandler, 0));
+	matter_zigbee_ui_button_init();
+	matter_zigbee_ui_led_register_matter_events();
 
 	ReturnErrorOnFailure(sIdentifyCluster.Init());
-
 	ReturnErrorOnFailure(Nrf::Matter::StartServer());
 
 #if defined(CONFIG_MATTER_ZIGBEE_COEXISTENCE)

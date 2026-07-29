@@ -5,8 +5,8 @@
 #
 
 menuconfig MATTER_ZIGBEE_UI
-	bool "Shared UI definitions for combined Matter + Zigbee samples"
-	depends on MATTER_ZIGBEE_ADD_ON
+	bool "Shared UI module for combined Matter + Zigbee samples"
+	depends on MATTER_ZIGBEE_ADD_ON && CHIP
 	default y
 	help
 	  Central button and LED role definitions used by the samples.
@@ -19,5 +19,9 @@ config MATTER_ZIGBEE_UI_FACTORY_RESET_PRESS_TIME_SECONDS
 	default 5
 	help
 	  Hold time for factory reset using button.
+
+module = MATTER_ZIGBEE_UI
+module-str = Matter/Zigbee UI
+source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
 
 endif # MATTER_ZIGBEE_UI

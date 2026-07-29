@@ -14,7 +14,9 @@
 
 #include <matter_zigbee_coexistence.h>
 #include <matter_zigbee_protocol_state.h>
+#include <matter_zigbee_ui.h>
 #include <matter_zigbee_ui_config.h>
+#include <matter_zigbee_ui_led.h>
 
 #include <dk_buttons_and_leds.h>
 #include <ram_pwrdn.h>
@@ -77,29 +79,15 @@
  */
 #define ERASE_PERSISTENT_CONFIG ZB_FALSE
 
-/* LED indicating that light witch found a light bulb to control. */
-#define BULB_FOUND_LED DK_LED4
-/* Button ID used to switch on the light bulb. */
-#define BUTTON_ON DK_BTN1_MSK
-/* Button ID used to switch off the light bulb. */
-#define BUTTON_OFF DK_BTN2_MSK
-/* Dim step size - increases/decreses current level (range 0x000 - 0xfe). */
-#define DIMM_STEP      15
-/* Button ID used to enable sleepy behavior (sampled once at boot). */
-#define BUTTON_SLEEPY DK_BTN3_MSK
-
-#if defined(CONFIG_ZIGBEE_TOUCHLINK_INITIATOR)
-/* Short press starts Touchlink. */
-#define BUTTON_TOUCHLINK DK_BTN3_MSK
-#endif
-
-/* Transition time for a single step operation in 0.1 sec units.
- * 0xFFFF - immediate change.
- */
+/* LED indicating that the switch found a light bulb to control. */
+#define BULB_FOUND_LED MATTER_ZIGBEE_UI_LED_LIGHT
+/* Dim step size - increases/decreases current level (range 0x000 - 0xfe). */
+#define DIMM_STEP MATTER_ZIGBEE_UI_DIM_STEP
+/* Transition time for a single step operation in 0.1 sec units. */
 #define DIMM_TRANSACTION_TIME 2
-
-/* Time after which the button state is checked again to detect button hold. */
-#define BUTTON_LONG_POLL_TMO K_MSEC(500)
+/* Time after which a button hold is detected. */
+#define BUTTON_HOLD_THRESHOLD K_MSEC(MATTER_ZIGBEE_UI_DIM_HOLD_THRESHOLD_MS)
+#define BUTTON_DIM_INTERVAL   K_MSEC(MATTER_ZIGBEE_UI_DIM_INTERVAL_MS)
 
 #if !defined ZB_ED_ROLE
 #error Define ZB_ED_ROLE to compile light switch (End Device) source code.
@@ -144,9 +132,9 @@ struct bulb_context {
 };
 
 struct buttons_context {
-	uint32_t state;
-	atomic_t long_poll;
-	struct k_timer alarm;
+	uint32_t hold_mask;
+	atomic_t hold_active;
+	struct k_timer hold_timer;
 };
 
 struct zb_device_ctx {
@@ -282,19 +270,11 @@ static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 	}
 #endif
 
-	/* Inform default signal handler about user input at the device. */
 	user_input_indicate();
-
-	check_factory_reset_button(button_state, has_changed);
 
 #if defined(CONFIG_ZIGBEE_TOUCHLINK_INITIATOR)
 #if defined(CONFIG_MATTER_ZIGBEE_COEXISTENCE) && defined(CONFIG_MATTER_ZIGBEE_COEXISTENCE_BUTTON_SWITCH)
 	if (protocol_switch_short_release) {
-		ZB_SCHEDULE_APP_CALLBACK(light_switch_touchlink_initiator_start_cb, 0);
-		return;
-	}
-#else
-	if ((has_changed & BUTTON_TOUCHLINK) && (button_state & BUTTON_TOUCHLINK)) {
 		ZB_SCHEDULE_APP_CALLBACK(light_switch_touchlink_initiator_start_cb, 0);
 		return;
 	}
@@ -306,60 +286,33 @@ static void zb_button_handler_impl(uint32_t button_state, uint32_t has_changed)
 		return;
 	}
 
-	switch (has_changed) {
-	case BUTTON_ON:
-		LOG_DBG("ON - button changed");
-		cmd_id = ZB_ZCL_CMD_ON_OFF_ON_ID;
-		break;
-	case BUTTON_OFF:
-		LOG_DBG("OFF - button changed");
-		cmd_id = ZB_ZCL_CMD_ON_OFF_OFF_ID;
-		break;
-	case MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK:
-		if (MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK & button_state) {
-			/* Button changed its state to pressed */
+	if (has_changed & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+		if (button_state & MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+			buttons_ctx.hold_mask = MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK;
+			atomic_set(&buttons_ctx.hold_active, ZB_FALSE);
+			k_timer_start(&buttons_ctx.hold_timer, BUTTON_HOLD_THRESHOLD, K_NO_WAIT);
 		} else {
-			/* Button changed its state to released */
-			if (was_factory_reset_done()) {
-				/* The long press was for Factory Reset */
-				LOG_DBG("After Factory Reset - ignore button release");
-			} else {
-				/* Button released before Factory Reset */
-
-				/* Start identification mode */
-				ZB_SCHEDULE_APP_CALLBACK(start_identifying, 0);
+			k_timer_stop(&buttons_ctx.hold_timer);
+			if (atomic_set(&buttons_ctx.hold_active, ZB_FALSE) == ZB_FALSE) {
+				cmd_id = ZB_ZCL_CMD_ON_OFF_TOGGLE_ID;
+				zb_err_code = zb_buf_get_out_delayed_ext(light_switch_send_on_off, cmd_id, 0);
+				ZB_ERROR_CHECK(zb_err_code);
 			}
 		}
 		return;
-	default:
-		LOG_DBG("Unhandled button");
-		return;
 	}
 
-	switch (button_state) {
-	case BUTTON_ON:
-	case BUTTON_OFF:
-		LOG_DBG("Button pressed");
-		buttons_ctx.state = button_state;
-
-		/* Alarm can be scheduled only once. Next alarm only resets
-		 * counting.
-		 */
-		k_timer_start(&buttons_ctx.alarm, BUTTON_LONG_POLL_TMO, K_NO_WAIT);
-		break;
-	case 0:
-		LOG_DBG("Button released");
-
-		k_timer_stop(&buttons_ctx.alarm);
-
-		if (atomic_set(&buttons_ctx.long_poll, ZB_FALSE) == ZB_FALSE) {
-			/* Allocate output buffer and send on/off command. */
-			zb_err_code = zb_buf_get_out_delayed_ext(light_switch_send_on_off, cmd_id, 0);
-			ZB_ERROR_CHECK(zb_err_code);
+	if (has_changed & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+		if (button_state & MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK) {
+			buttons_ctx.hold_mask = MATTER_ZIGBEE_UI_BUTTON_IDENTIFY_MSK;
+			atomic_set(&buttons_ctx.hold_active, ZB_FALSE);
+			k_timer_start(&buttons_ctx.hold_timer, BUTTON_HOLD_THRESHOLD, K_NO_WAIT);
+		} else {
+			k_timer_stop(&buttons_ctx.hold_timer);
+			if (atomic_set(&buttons_ctx.hold_active, ZB_FALSE) == ZB_FALSE) {
+				ZB_SCHEDULE_APP_CALLBACK(start_identifying, 0);
+			}
 		}
-		break;
-	default:
-		break;
 	}
 }
 
@@ -371,10 +324,7 @@ void zb_button_handler(uint32_t button_state, uint32_t has_changed)
 
 void zb_register_button_handler(void)
 {
-	static struct button_handler handler = {
-		.cb = zb_button_handler,
-	};
-	dk_button_handler_add(&handler);
+	matter_zigbee_ui_on_matter_board_ready(zb_button_handler);
 }
 #else
 /**@brief Callback wrapper for button events (non-Matter builds). */
@@ -404,7 +354,7 @@ static void configure_gpio(void)
 
 static void alarm_timers_init(void)
 {
-	k_timer_init(&buttons_ctx.alarm, light_switch_button_handler, NULL);
+	k_timer_init(&buttons_ctx.hold_timer, light_switch_button_handler, NULL);
 	k_timer_init(&bulb_ctx.find_alarm, find_light_bulb_alarm, NULL);
 }
 
@@ -423,36 +373,16 @@ static void app_clusters_attr_init(void)
  *
  * @param  bufid  Unused parameter, required by ZBOSS scheduler API.
  */
-static void toggle_identify_led(zb_bufid_t bufid)
-{
-	static int blink_status;
-
-	led_set(MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK, (++blink_status) % 2);
-	ZB_SCHEDULE_APP_ALARM(toggle_identify_led, bufid, ZB_MILLISECONDS_TO_BEACON_INTERVAL(100));
-}
-
 /**@brief Function to handle identify notification events on the first endpoint.
  *
  * @param  bufid  Unused parameter, required by ZBOSS scheduler API.
  */
 static void identify_cb(zb_bufid_t bufid)
 {
-	zb_ret_t zb_err_code;
-
 	if (bufid) {
-		/* Schedule a self-scheduling function that will toggle the LED. */
-		ZB_SCHEDULE_APP_CALLBACK(toggle_identify_led, bufid);
+		matter_zigbee_ui_led_zigbee_identify_start();
 	} else {
-		/* Cancel the toggling function alarm and turn off LED. */
-		zb_err_code = ZB_SCHEDULE_APP_ALARM_CANCEL(toggle_identify_led, ZB_ALARM_ANY_PARAM);
-		ZVUNUSED(zb_err_code);
-
-		/* Update network status/idenitfication LED. */
-		if (ZB_JOINED()) {
-			led_set_on(MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
-		} else {
-			led_set_off(MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
-		}
+		matter_zigbee_ui_led_zigbee_identify_stop();
 	}
 }
 
@@ -515,7 +445,7 @@ static void find_light_bulb_cb(zb_bufid_t bufid)
 		LOG_INF("Found bulb addr: %d ep: %d", bulb_ctx.short_addr, bulb_ctx.endpoint);
 
 		k_timer_stop(&bulb_ctx.find_alarm);
-		led_set_on(BULB_FOUND_LED);
+		matter_zigbee_ui_led_set_bulb_found(true);
 	} else if (bulb_ctx.short_addr != 0xFFFF) {
 		LOG_DBG("Match descriptor response ignored (bulb already selected)");
 	} else if ((resp->status != ZB_ZDP_STATUS_SUCCESS) || (resp->match_len == 0)) {
@@ -589,25 +519,27 @@ static void light_switch_button_handler(struct k_timer *timer)
 {
 	zb_ret_t zb_err_code;
 	zb_uint16_t cmd_id;
+	uint32_t buttons = dk_get_buttons();
 
-	if (dk_get_buttons() & buttons_ctx.state) {
-		atomic_set(&buttons_ctx.long_poll, ZB_TRUE);
-		if (buttons_ctx.state == BUTTON_ON) {
-			cmd_id = ZB_ZCL_LEVEL_CONTROL_STEP_MODE_UP;
-		} else {
-			cmd_id = ZB_ZCL_LEVEL_CONTROL_STEP_MODE_DOWN;
-		}
-
-		/* Allocate output buffer and send step command. */
-		zb_err_code = zb_buf_get_out_delayed_ext(light_switch_send_step, cmd_id, 0);
-		if (zb_err_code != RET_OK) {
-			LOG_ERR("Failed to schedule buffer allocation: %d", zb_err_code);
-		}
-
-		k_timer_start(&buttons_ctx.alarm, BUTTON_LONG_POLL_TMO, K_NO_WAIT);
-	} else {
-		atomic_set(&buttons_ctx.long_poll, ZB_FALSE);
+	if (!(buttons & buttons_ctx.hold_mask)) {
+		atomic_set(&buttons_ctx.hold_active, ZB_FALSE);
+		return;
 	}
+
+	atomic_set(&buttons_ctx.hold_active, ZB_TRUE);
+
+	if (buttons_ctx.hold_mask == MATTER_ZIGBEE_UI_BUTTON_LIGHT_MSK) {
+		cmd_id = ZB_ZCL_LEVEL_CONTROL_STEP_MODE_UP;
+	} else {
+		cmd_id = ZB_ZCL_LEVEL_CONTROL_STEP_MODE_DOWN;
+	}
+
+	zb_err_code = zb_buf_get_out_delayed_ext(light_switch_send_step, cmd_id, 0);
+	if (zb_err_code != RET_OK) {
+		LOG_ERR("Failed to schedule buffer allocation: %d", zb_err_code);
+	}
+
+	k_timer_start(&buttons_ctx.hold_timer, BUTTON_DIM_INTERVAL, K_NO_WAIT);
 }
 
 #if defined(CONFIG_ZIGBEE_FOTA) || defined(CONFIG_ZIGBEE_BT_DFU)
@@ -630,7 +562,7 @@ static void ota_evt_handler(const struct zigbee_fota_evt *evt)
 {
 	switch (evt->id) {
 	case ZIGBEE_FOTA_EVT_PROGRESS:
-		led_set(MATTER_ZIGBEE_UI_LED_OTA_ACTIVITY, evt->dl.progress % 2);
+		led_set(MATTER_ZIGBEE_UI_LED_ZIGBEE, evt->dl.progress % 2);
 		break;
 
 	case ZIGBEE_FOTA_EVT_FINISHED:
@@ -681,7 +613,7 @@ void zboss_signal_handler(zb_bufid_t bufid)
 	zb_ret_t status = ZB_GET_APP_SIGNAL_STATUS(bufid);
 
 	/* Update network status LED. */
-	zigbee_led_status_update(bufid, MATTER_ZIGBEE_UI_LED_ZIGBEE_NETWORK);
+	matter_zigbee_ui_led_zigbee_signal(bufid);
 
 #ifdef CONFIG_ZIGBEE_FOTA
 	/* Pass signal to the OTA client implementation. */
@@ -727,6 +659,7 @@ void zboss_signal_handler(zb_bufid_t bufid)
 
 			if (leave_params->leave_type == ZB_NWK_LEAVE_TYPE_RESET) {
 				bulb_ctx.short_addr = 0xFFFF;
+				matter_zigbee_ui_led_set_bulb_found(false);
 			}
 		}
 		/* Call default signal handler. */
@@ -886,7 +819,6 @@ int ZigbeeStart(void)
 
 #ifndef CONFIG_CHIP
 	configure_gpio();
-	register_factory_reset_button(MATTER_ZIGBEE_UI_BUTTON_FACTORY_RESET_MSK);
 #endif
 
 	alarm_timers_init();
@@ -906,7 +838,7 @@ int ZigbeeStart(void)
 #elif defined(CONFIG_CHIP)
 	bool enable_sleepy = false;
 #else
-	bool enable_sleepy = (dk_get_buttons() & BUTTON_SLEEPY) ? true : false;
+	bool enable_sleepy = false;
 #endif
 
 	if (enable_sleepy) {

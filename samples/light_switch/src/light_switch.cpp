@@ -57,7 +57,7 @@ void LightSwitch::InitiateActionSwitch(Action action)
 	}
 }
 
-void LightSwitch::DimmerChangeBrightness()
+void LightSwitch::DimmerChangeBrightness(bool increase)
 {
 	static uint16_t sBrightness;
 	Nrf::Matter::BindingHandler::BindingData *data = Platform::New<Nrf::Matter::BindingHandler::BindingData>();
@@ -66,9 +66,14 @@ void LightSwitch::DimmerChangeBrightness()
 		data->CommandId = Clusters::LevelControl::Commands::MoveToLevel::Id;
 		data->ClusterId = Clusters::LevelControl::Id;
 		data->InvokeCommandFunc = SwitchChangedHandler;
-		/* add to brightness 3 to approximate 1% step of brightness after each call dimmer change. */
-		sBrightness += kOnePercentBrightnessApproximation;
-		if (sBrightness > kMaximumBrightness) {
+		if (increase) {
+			sBrightness += kOnePercentBrightnessApproximation;
+			if (sBrightness > kMaximumBrightness) {
+				sBrightness = 0;
+			}
+		} else if (sBrightness > kOnePercentBrightnessApproximation) {
+			sBrightness -= kOnePercentBrightnessApproximation;
+		} else {
 			sBrightness = 0;
 		}
 		data->Value = (uint8_t)sBrightness;

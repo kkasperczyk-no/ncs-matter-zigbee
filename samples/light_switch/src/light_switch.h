@@ -29,7 +29,7 @@ public:
 
 	void Init(chip::EndpointId lightSwitchEndpoint);
 	void InitiateActionSwitch(Action action);
-	void DimmerChangeBrightness();
+	void DimmerChangeBrightness(bool increase = true);
 	chip::EndpointId GetLightSwitchEndpointId() { return mLightSwitchEndpoint; }
 	static void SwitchChangedHandler(const chip::app::Clusters::Binding::TableEntry &binding,
 					 chip::OperationalDeviceProxy *deviceProxy,
